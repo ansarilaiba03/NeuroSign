@@ -1,9 +1,46 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# PROJECT STRUCTURE NOTES
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# model/keypoint_classifier/
+#   keypoint.csv                      → your raw training data (landmarks)
+#   keypoint_classifier_label.csv     → class names (A, B, C... one per line)
+#   keypoint_classifier.hdf5          → full Keras model (used for retraining only)
+#   keypoint_classifier.tflite        → compressed model (used by app.py at runtime)
+#   keypoint_classifier.py            → inference wrapper called by app.py
+#
+# model/point_history_classifier/
+#   point_history.csv                 → training data for motion/dynamic gestures
+#   point_history_classifier.hdf5     → full Keras model (retraining only)
+#   point_history_classifier.tflite   → used by app.py at runtime
+#   point_history_classifier.py       → inference wrapper called by app.py
+#   (not needed for static ISL alphabets but kept to avoid import errors)
+#
+# utils/
+#   cvfpscalc.py                      → just calculates FPS for the display
+#
+# keypoint_classification.ipynb       → run this to retrain after collecting data
+#
+# CONTROLS (while app.py is running):
+#   K   → enter logging mode, terminal asks for class name (A, B, HELLO etc.)
+#   S   → save current frame landmarks to keypoint.csv
+#   N   → back to normal inference mode
+#   ESC → quit
+#
+# FEATURE VECTOR:
+#   Always 84 features = 42 (left/only hand) + 42 (right hand or zeros if absent)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+
+
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 import csv
 import copy
 import argparse
 import itertools
+import os
 from collections import Counter
 from collections import deque
 
@@ -18,212 +55,274 @@ from model import PointHistoryClassifier
 
 def get_args():
     parser = argparse.ArgumentParser()
-
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--width", help='cap width', type=int, default=960)
+    parser.add_argument("--width",  help='cap width',  type=int, default=960)
     parser.add_argument("--height", help='cap height', type=int, default=540)
-
     parser.add_argument('--use_static_image_mode', action='store_true')
-    parser.add_argument("--min_detection_confidence",
-                        help='min_detection_confidence',
-                        type=float,
-                        default=0.7)
-    parser.add_argument("--min_tracking_confidence",
-                        help='min_tracking_confidence',
-                        type=int,
-                        default=0.5)
-
+    parser.add_argument("--min_detection_confidence", type=float, default=0.7)
+    parser.add_argument("--min_tracking_confidence",  type=int,   default=0.5)
     args = parser.parse_args()
     return args
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature constants
+# ─────────────────────────────────────────────────────────────────────────────
+TOTAL_FEATURES = 84          # 21 landmarks × 2 coords × 2 hands
+HAND_FEATURES  = 42          # 21 landmarks × 2 coords × 1 hand
+PADDING        = [0.0] * HAND_FEATURES   # fills in missing second hand
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSV / label file paths
+# ─────────────────────────────────────────────────────────────────────────────
+KEYPOINT_CSV   = 'model/keypoint_classifier/keypoint.csv'
+LABEL_CSV      = 'model/keypoint_classifier/keypoint_classifier_label.csv'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Class registry — loads existing labels from the label CSV so class IDs are
+# stable across sessions.  New class names are appended automatically.
+# ─────────────────────────────────────────────────────────────────────────────
+def load_class_registry(label_path):
+    """Returns {name: id} dict loaded from the label CSV (creates file if absent)."""
+    registry = {}
+    if os.path.exists(label_path):
+        with open(label_path, encoding='utf-8-sig') as f:
+            for idx, row in enumerate(csv.reader(f)):
+                if row:
+                    registry[row[0].strip()] = idx
+    return registry
+
+
+def save_class_registry(label_path, registry):
+    """Writes the label CSV in id order."""
+    ordered = sorted(registry.items(), key=lambda x: x[1])
+    with open(label_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        for name, _ in ordered:
+            writer.writerow([name])
+
+
+def get_or_create_class(registry, label_path, name):
+    """Returns the integer id for name, creating a new entry if needed."""
+    name = name.strip().upper()
+    if name not in registry:
+        new_id = len(registry)
+        registry[name] = new_id
+        save_class_registry(label_path, registry)
+        print(f"  [Registry] New class '{name}' assigned id {new_id}")
+    return registry[name]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
     args = get_args()
 
-    cap_device = args.device
-    cap_width = args.width
-    cap_height = args.height
-
-    use_static_image_mode = args.use_static_image_mode
-    min_detection_confidence = args.min_detection_confidence
-    min_tracking_confidence = args.min_tracking_confidence
-
     use_brect = True
 
-    # Camera preparation
-    cap = cv.VideoCapture(cap_device)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
+    # Camera
+    cap = cv.VideoCapture(args.device)
+    cap.set(cv.CAP_PROP_FRAME_WIDTH,  args.width)
+    cap.set(cv.CAP_PROP_FRAME_HEIGHT, args.height)
 
-    # Model load
+    # MediaPipe
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
-        static_image_mode=use_static_image_mode,
+        static_image_mode=args.use_static_image_mode,
         max_num_hands=2,
-        min_detection_confidence=min_detection_confidence,
-        min_tracking_confidence=min_tracking_confidence,
+        min_detection_confidence=args.min_detection_confidence,
+        min_tracking_confidence=args.min_tracking_confidence,
     )
 
-    keypoint_classifier = KeyPointClassifier()
+    keypoint_classifier      = KeyPointClassifier()
     point_history_classifier = PointHistoryClassifier()
 
-    # Read labels
-    with open('model/keypoint_classifier/keypoint_classifier_label.csv',
-              encoding='utf-8-sig') as f:
-        keypoint_classifier_labels = [row[0] for row in csv.reader(f)]
+    # Load label registries
+    class_registry = load_class_registry(LABEL_CSV)
 
     with open('model/point_history_classifier/point_history_classifier_label.csv',
               encoding='utf-8-sig') as f:
         point_history_classifier_labels = [row[0] for row in csv.reader(f)]
 
-    # FPS Measurement
+    # Reload keypoint labels list (used for live inference display)
+    def get_keypoint_labels():
+        ordered = sorted(class_registry.items(), key=lambda x: x[1])
+        return [name for name, _ in ordered]
+
+    # FPS
     cvFpsCalc = CvFpsCalc(buffer_len=10)
 
-    # Coordinate history
-    history_length = 16
-    point_history = deque(maxlen=history_length)
-
-    # Finger gesture history
+    # Point history
+    history_length         = 16
+    point_history          = deque(maxlen=history_length)
     finger_gesture_history = deque(maxlen=history_length)
 
-    mode = 0
+    # ── Logging state ──────────────────────────────────────────────────────
+    # mode 0 = normal inference
+    # mode 1 = keypoint logging  (press K to enter, S to save each frame)
+    mode             = 0
+    current_class_id = -1     # set when user picks a class in mode 1
+    current_class_name = ""
+    saved_count      = 0      # frames saved for current class this session
+
+    print("Controls:")
+    print("  K        → enter keypoint-logging mode (you'll be prompted for class name)")
+    print("  S        → save current frame's landmarks to CSV (in logging mode)")
+    print("  N        → return to normal inference mode")
+    print("  ESC      → quit")
 
     while True:
         fps = cvFpsCalc.get()
-
         key = cv.waitKey(10)
-        if key == 27:  # ESC to quit
-            break
-        number, mode = select_mode(key, mode)
 
-        # Camera capture
+        # ── Key handling ───────────────────────────────────────────────────
+        if key == 27:   # ESC
+            break
+
+        if key == ord('n') or key == ord('N'):
+            mode = 0
+            current_class_id   = -1
+            current_class_name = ""
+            saved_count        = 0
+            print("Mode → Normal inference")
+
+        if key == ord('k') or key == ord('K'):
+            # Ask for class name in the terminal
+            cv.destroyAllWindows()   # briefly hide window so terminal is visible
+            class_input = input("\nEnter class name (e.g. A, B, HELLO): ").strip().upper()
+            if class_input:
+                current_class_id   = get_or_create_class(class_registry, LABEL_CSV, class_input)
+                current_class_name = class_input
+                saved_count        = 0
+                mode               = 1
+                print(f"  Logging mode ON  →  class '{current_class_name}' (id {current_class_id})")
+                print(f"  Press S to save each frame.  Press N to stop.")
+            else:
+                print("  No class name entered — staying in normal mode.")
+            cv.namedWindow('Hand Gesture Recognition')
+
+        # ── Camera capture ─────────────────────────────────────────────────
         ret, image = cap.read()
         if not ret:
             break
-        image = cv.flip(image, 1)
+        image       = cv.flip(image, 1)
         debug_image = copy.deepcopy(image)
 
-        # MediaPipe detection
+        # ── MediaPipe ──────────────────────────────────────────────────────
         image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
         image.flags.writeable = False
         results = hands.process(image)
         image.flags.writeable = True
 
+        feature_vector   = None   # will be set if hands are detected
+        hand_sign_id     = -1
+        brect            = [0, 0, 0, 0]
+        handedness_obj   = None
+        landmark_list    = None
+
         if results.multi_hand_landmarks is not None:
             num_hands = len(results.multi_hand_landmarks)
 
-            # ---------------------------------------------------------------
-            # TWO-HAND MODE  (e.g. ISL letters that need both hands)
-            # The classifier receives 42 landmarks (21 per hand) concatenated.
-            # Make sure your keypoint_classifier is trained on 84 features
-            # (42 points × 2 coords) when you collect two-hand samples.
-            # ---------------------------------------------------------------
-            if num_hands == 2:
-                hand_landmarks_list = results.multi_hand_landmarks      # [hand0, hand1]
-                handedness_list     = results.multi_handedness           # [handed0, handed1]
-
-                # Sort so that Left hand always comes first → consistent feature order
-                # multi_handedness label is from MediaPipe's perspective (already mirrored)
-                paired = list(zip(hand_landmarks_list, handedness_list))
-                paired.sort(key=lambda x: x[1].classification[0].label)   # 'Left' < 'Right'
-
-                lm_lists = [calc_landmark_list(debug_image, p[0]) for p in paired]
-
-                # Combine both hands into one flat feature vector
-                combined_landmarks = lm_lists[0] + lm_lists[1]           # 42 points
-                pre_processed_combined = pre_process_landmark(combined_landmarks)
-
-                # Bounding rect that covers BOTH hands
-                brect = calc_bounding_rect_combined(debug_image,
-                                                    paired[0][0],
-                                                    paired[1][0])
-
-                # Logging (mode k → keypoint CSV, mode h → point history CSV)
-                pre_processed_point_history_list = pre_process_point_history(
-                    debug_image, point_history)
-                logging_csv(number, mode, pre_processed_combined,
-                            pre_processed_point_history_list)
-
-                # Classification using combined 42-point vector
-                hand_sign_id = keypoint_classifier(pre_processed_combined)
-
-                # Point-history tracking: use index-finger tip of the RIGHT hand
-                right_lm = lm_lists[1] if paired[1][1].classification[0].label == 'Right' else lm_lists[0]
-                if hand_sign_id == 2:   # "Point" gesture — adjust ID if needed
-                    point_history.append(right_lm[8])
-                else:
-                    point_history.append([0, 0])
-
-                # Finger gesture classification
-                finger_gesture_id = 0
-                if len(pre_processed_point_history_list) == (history_length * 2):
-                    finger_gesture_id = point_history_classifier(
-                        pre_processed_point_history_list)
-                finger_gesture_history.append(finger_gesture_id)
-                most_common_fg_id = Counter(finger_gesture_history).most_common()
-
-                # Draw both hands
-                for lm_list, (hand_lm, handedness) in zip(lm_lists, paired):
-                    debug_image = draw_landmarks(debug_image, lm_list)
-
-                # Draw combined bounding box and label
-                debug_image = draw_bounding_rect(use_brect, debug_image, brect)
-                debug_image = draw_info_text(
-                    debug_image,
-                    brect,
-                    paired[0][1],   # show handedness of first hand
-                    keypoint_classifier_labels[hand_sign_id],
-                    point_history_classifier_labels[most_common_fg_id[0][0]],
-                )
-
-            # ---------------------------------------------------------------
-            # SINGLE-HAND MODE  (most ISL letters use one hand)
-            # The classifier receives 21 landmarks → 42 features.
-            # ---------------------------------------------------------------
-            else:
+            # ── Single hand ────────────────────────────────────────────────
+            if num_hands == 1:
                 hand_landmarks = results.multi_hand_landmarks[0]
-                handedness      = results.multi_handedness[0]
+                handedness_obj = results.multi_handedness[0]
 
-                brect = calc_bounding_rect(debug_image, hand_landmarks)
+                brect         = calc_bounding_rect(debug_image, hand_landmarks)
                 landmark_list = calc_landmark_list(debug_image, hand_landmarks)
 
-                pre_processed_landmark_list = pre_process_landmark(landmark_list)
-                pre_processed_point_history_list = pre_process_point_history(
+                pre_processed = pre_process_landmark(landmark_list)
+                feature_vector = pre_processed + PADDING   # pad to 84
+
+                pre_processed_point_history = pre_process_point_history(
                     debug_image, point_history)
 
-                logging_csv(number, mode, pre_processed_landmark_list,
-                            pre_processed_point_history_list)
+                # Save on S keypress
+                if mode == 1 and current_class_id >= 0 and (key == ord('s') or key == ord('S')):
+                    log_keypoint(current_class_id, feature_vector)
+                    saved_count += 1
+                    print(f"  Saved frame {saved_count} for '{current_class_name}'")
 
-                hand_sign_id = -1 #keypoint_classifier(pre_processed_landmark_list)
+                # Inference
+                hand_sign_id = keypoint_classifier(feature_vector)
 
-                if hand_sign_id == 2:   # Point gesture
+                if hand_sign_id == 2:
                     point_history.append(landmark_list[8])
                 else:
                     point_history.append([0, 0])
 
                 finger_gesture_id = 0
-                if len(pre_processed_point_history_list) == (history_length * 2):
-                    finger_gesture_id = point_history_classifier(
-                        pre_processed_point_history_list)
+                if len(pre_processed_point_history) == (history_length * 2):
+                    finger_gesture_id = point_history_classifier(pre_processed_point_history)
                 finger_gesture_history.append(finger_gesture_id)
                 most_common_fg_id = Counter(finger_gesture_history).most_common()
+
+                kp_labels = get_keypoint_labels()
+                sign_label = kp_labels[hand_sign_id] if 0 <= hand_sign_id < len(kp_labels) else "?"
 
                 debug_image = draw_bounding_rect(use_brect, debug_image, brect)
                 debug_image = draw_landmarks(debug_image, landmark_list)
                 debug_image = draw_info_text(
-                    debug_image,
-                    brect,
-                    handedness,
-                    keypoint_classifier_labels[hand_sign_id],
+                    debug_image, brect, handedness_obj, sign_label,
+                    point_history_classifier_labels[most_common_fg_id[0][0]],
+                )
+
+            # ── Two hands ──────────────────────────────────────────────────
+            else:
+                hand_landmarks_list = results.multi_hand_landmarks
+                handedness_list     = results.multi_handedness
+
+                paired = list(zip(hand_landmarks_list, handedness_list))
+                paired.sort(key=lambda x: x[1].classification[0].label)
+
+                lm_lists = [calc_landmark_list(debug_image, p[0]) for p in paired]
+
+                pre_left  = pre_process_landmark(lm_lists[0])
+                pre_right = pre_process_landmark(lm_lists[1])
+                feature_vector = pre_left + pre_right   # 84 features
+
+                brect = calc_bounding_rect_combined(debug_image, paired[0][0], paired[1][0])
+
+                pre_processed_point_history = pre_process_point_history(
+                    debug_image, point_history)
+
+                # Save on S keypress
+                if mode == 1 and current_class_id >= 0 and (key == ord('s') or key == ord('S')):
+                    log_keypoint(current_class_id, feature_vector)
+                    saved_count += 1
+                    print(f"  Saved frame {saved_count} for '{current_class_name}'")
+
+                # Inference
+                hand_sign_id = keypoint_classifier(feature_vector)
+
+                point_history.append([0, 0])
+
+                finger_gesture_id = 0
+                if len(pre_processed_point_history) == (history_length * 2):
+                    finger_gesture_id = point_history_classifier(pre_processed_point_history)
+                finger_gesture_history.append(finger_gesture_id)
+                most_common_fg_id = Counter(finger_gesture_history).most_common()
+
+                kp_labels  = get_keypoint_labels()
+                sign_label = kp_labels[hand_sign_id] if 0 <= hand_sign_id < len(kp_labels) else "?"
+
+                for lm_list in lm_lists:
+                    debug_image = draw_landmarks(debug_image, lm_list)
+
+                debug_image = draw_bounding_rect(use_brect, debug_image, brect)
+                debug_image = draw_info_text(
+                    debug_image, brect, paired[0][1], sign_label,
                     point_history_classifier_labels[most_common_fg_id[0][0]],
                 )
 
         else:
-            # No hands detected
             point_history.append([0, 0])
 
         debug_image = draw_point_history(debug_image, point_history)
-        debug_image = draw_info(debug_image, fps, mode, number)
+        debug_image = draw_logging_info(debug_image, fps, mode,
+                                        current_class_name, saved_count)
 
         cv.imshow('Hand Gesture Recognition', debug_image)
 
@@ -231,47 +330,38 @@ def main():
     cv.destroyAllWindows()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# NEW HELPER: bounding rect that wraps TWO hand landmark sets
-# ──────────────────────────────────────────────────────────────────────────────
-def calc_bounding_rect_combined(image, landmarks1, landmarks2):
-    """Returns a bounding rect [x1, y1, x2, y2] that covers both hands."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+def log_keypoint(class_id, feature_vector):
+    os.makedirs(os.path.dirname(KEYPOINT_CSV), exist_ok=True)
+    with open(KEYPOINT_CSV, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([class_id, *feature_vector])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Geometry helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def calc_bounding_rect(image, landmarks):
     image_width, image_height = image.shape[1], image.shape[0]
     landmark_array = np.empty((0, 2), int)
+    for landmark in landmarks.landmark:
+        lx = min(int(landmark.x * image_width),  image_width  - 1)
+        ly = min(int(landmark.y * image_height), image_height - 1)
+        landmark_array = np.append(landmark_array, [[lx, ly]], axis=0)
+    x, y, w, h = cv.boundingRect(landmark_array)
+    return [x, y, x + w, y + h]
 
+
+def calc_bounding_rect_combined(image, landmarks1, landmarks2):
+    image_width, image_height = image.shape[1], image.shape[0]
+    landmark_array = np.empty((0, 2), int)
     for landmarks in [landmarks1, landmarks2]:
         for landmark in landmarks.landmark:
             lx = min(int(landmark.x * image_width),  image_width  - 1)
             ly = min(int(landmark.y * image_height), image_height - 1)
             landmark_array = np.append(landmark_array, [[lx, ly]], axis=0)
-
-    x, y, w, h = cv.boundingRect(landmark_array)
-    return [x, y, x + w, y + h]
-
-
-def select_mode(key, mode):
-    number = -1
-    if 48 <= key <= 57:  # 0 ~ 9
-        number = key - 48
-    if key == 110:  # n
-        mode = 0
-    if key == 107:  # k
-        mode = 1
-    if key == 104:  # h
-        mode = 2
-    return number, mode
-
-
-def calc_bounding_rect(image, landmarks):
-    image_width, image_height = image.shape[1], image.shape[0]
-    landmark_array = np.empty((0, 2), int)
-
-    for _, landmark in enumerate(landmarks.landmark):
-        landmark_x = min(int(landmark.x * image_width),  image_width  - 1)
-        landmark_y = min(int(landmark.y * image_height), image_height - 1)
-        landmark_array = np.append(landmark_array,
-                                   [np.array((landmark_x, landmark_y))], axis=0)
-
     x, y, w, h = cv.boundingRect(landmark_array)
     return [x, y, x + w, y + h]
 
@@ -279,172 +369,110 @@ def calc_bounding_rect(image, landmarks):
 def calc_landmark_list(image, landmarks):
     image_width, image_height = image.shape[1], image.shape[0]
     landmark_point = []
-
-    for _, landmark in enumerate(landmarks.landmark):
-        landmark_x = min(int(landmark.x * image_width),  image_width  - 1)
-        landmark_y = min(int(landmark.y * image_height), image_height - 1)
-        landmark_point.append([landmark_x, landmark_y])
-
+    for landmark in landmarks.landmark:
+        lx = min(int(landmark.x * image_width),  image_width  - 1)
+        ly = min(int(landmark.y * image_height), image_height - 1)
+        landmark_point.append([lx, ly])
     return landmark_point
 
 
 def pre_process_landmark(landmark_list):
-    temp_landmark_list = copy.deepcopy(landmark_list)
-
-    # Convert to relative coordinates (anchor = first point)
-    base_x, base_y = temp_landmark_list[0][0], temp_landmark_list[0][1]
-    for index in range(len(temp_landmark_list)):
-        temp_landmark_list[index][0] -= base_x
-        temp_landmark_list[index][1] -= base_y
-
-    # Flatten
-    temp_landmark_list = list(itertools.chain.from_iterable(temp_landmark_list))
-
-    # Normalize
-    max_value = max(map(abs, temp_landmark_list))
-    temp_landmark_list = [n / max_value for n in temp_landmark_list]
-
-    return temp_landmark_list
+    temp = copy.deepcopy(landmark_list)
+    base_x, base_y = temp[0][0], temp[0][1]
+    for i in range(len(temp)):
+        temp[i][0] -= base_x
+        temp[i][1] -= base_y
+    flat = list(itertools.chain.from_iterable(temp))
+    max_val = max(map(abs, flat))
+    if max_val > 0:
+        flat = [n / max_val for n in flat]
+    return flat
 
 
 def pre_process_point_history(image, point_history):
     image_width, image_height = image.shape[1], image.shape[0]
-    temp_point_history = copy.deepcopy(point_history)
-
+    temp = copy.deepcopy(point_history)
     base_x, base_y = 0, 0
-    for index, point in enumerate(temp_point_history):
-        if index == 0:
+    for i, point in enumerate(temp):
+        if i == 0:
             base_x, base_y = point[0], point[1]
-        temp_point_history[index][0] = (temp_point_history[index][0] - base_x) / image_width
-        temp_point_history[index][1] = (temp_point_history[index][1] - base_y) / image_height
-
-    temp_point_history = list(itertools.chain.from_iterable(temp_point_history))
-    return temp_point_history
+        temp[i][0] = (temp[i][0] - base_x) / image_width
+        temp[i][1] = (temp[i][1] - base_y) / image_height
+    return list(itertools.chain.from_iterable(temp))
 
 
-def logging_csv(number, mode, landmark_list, point_history_list):
-    if mode == 0:
-        pass
-    if mode == 1 and (0 <= number <= 9):
-        csv_path = 'model/keypoint_classifier/keypoint.csv'
-        with open(csv_path, 'a', newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([number, *landmark_list])
-    if mode == 2 and (0 <= number <= 9):
-        csv_path = 'model/point_history_classifier/point_history.csv'
-        with open(csv_path, 'a', newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([number, *point_history_list])
-    return
-
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Drawing helpers
+# ─────────────────────────────────────────────────────────────────────────────
 def draw_landmarks(image, landmark_point):
     if len(landmark_point) > 0:
-        # Thumb
-        cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[3]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[3]), (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[3]), tuple(landmark_point[4]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[3]), tuple(landmark_point[4]), (255, 255, 255), 2)
-        # Index finger
-        cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[6]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[6]), (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[6]), tuple(landmark_point[7]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[6]), tuple(landmark_point[7]), (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[7]), tuple(landmark_point[8]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[7]), tuple(landmark_point[8]), (255, 255, 255), 2)
-        # Middle finger
-        cv.line(image, tuple(landmark_point[9]),  tuple(landmark_point[10]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[9]),  tuple(landmark_point[10]), (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[10]), tuple(landmark_point[11]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[10]), tuple(landmark_point[11]), (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[11]), tuple(landmark_point[12]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[11]), tuple(landmark_point[12]), (255, 255, 255), 2)
-        # Ring finger
-        cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[14]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[14]), (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[14]), tuple(landmark_point[15]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[14]), tuple(landmark_point[15]), (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[15]), tuple(landmark_point[16]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[15]), tuple(landmark_point[16]), (255, 255, 255), 2)
-        # Little finger
-        cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[18]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[18]), (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[18]), tuple(landmark_point[19]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[18]), tuple(landmark_point[19]), (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[19]), tuple(landmark_point[20]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[19]), tuple(landmark_point[20]), (255, 255, 255), 2)
-        # Palm
-        cv.line(image, tuple(landmark_point[0]),  tuple(landmark_point[1]),  (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[0]),  tuple(landmark_point[1]),  (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[1]),  tuple(landmark_point[2]),  (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[1]),  tuple(landmark_point[2]),  (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[2]),  tuple(landmark_point[5]),  (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[2]),  tuple(landmark_point[5]),  (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[5]),  tuple(landmark_point[9]),  (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[5]),  tuple(landmark_point[9]),  (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[9]),  tuple(landmark_point[13]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[9]),  tuple(landmark_point[13]), (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[17]), (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[17]), (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[0]),  (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[0]),  (255, 255, 255), 2)
+        connections = [
+            (2,3),(3,4),                         # thumb
+            (5,6),(6,7),(7,8),                   # index
+            (9,10),(10,11),(11,12),              # middle
+            (13,14),(14,15),(15,16),             # ring
+            (17,18),(18,19),(19,20),             # little
+            (0,1),(1,2),(2,5),(5,9),             # palm
+            (9,13),(13,17),(17,0),
+        ]
+        for a, b in connections:
+            cv.line(image, tuple(landmark_point[a]), tuple(landmark_point[b]), (0,0,0), 6)
+            cv.line(image, tuple(landmark_point[a]), tuple(landmark_point[b]), (255,255,255), 2)
 
-    for index, landmark in enumerate(landmark_point):
-        radius = 8 if index in [4, 8, 12, 16, 20] else 5
-        cv.circle(image, (landmark[0], landmark[1]), radius, (255, 255, 255), -1)
-        cv.circle(image, (landmark[0], landmark[1]), radius, (0, 0, 0), 1)
-
+        for idx, lm in enumerate(landmark_point):
+            r = 8 if idx in [4,8,12,16,20] else 5
+            cv.circle(image, tuple(lm), r, (255,255,255), -1)
+            cv.circle(image, tuple(lm), r, (0,0,0), 1)
     return image
 
 
 def draw_bounding_rect(use_brect, image, brect):
     if use_brect:
-        cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[3]),
-                     (0, 0, 0), 1)
+        cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[3]), (0,0,0), 1)
     return image
 
 
 def draw_info_text(image, brect, handedness, hand_sign_text, finger_gesture_text):
-    cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[1] - 22),
-                 (0, 0, 0), -1)
-
-    info_text = handedness.classification[0].label[0:]
-    if hand_sign_text != "":
-        info_text = info_text + ':' + hand_sign_text
-    cv.putText(image, info_text, (brect[0] + 5, brect[1] - 4),
-               cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
-
-    if finger_gesture_text != "":
-        cv.putText(image, "Finger Gesture:" + finger_gesture_text, (10, 60),
-                   cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4, cv.LINE_AA)
-        cv.putText(image, "Finger Gesture:" + finger_gesture_text, (10, 60),
-                   cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv.LINE_AA)
-
+    cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[1]-22), (0,0,0), -1)
+    info_text = handedness.classification[0].label
+    if hand_sign_text:
+        info_text += ':' + hand_sign_text
+    cv.putText(image, info_text, (brect[0]+5, brect[1]-4),
+               cv.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv.LINE_AA)
+    if finger_gesture_text:
+        cv.putText(image, "Finger Gesture:" + finger_gesture_text, (10,60),
+                   cv.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,0), 4, cv.LINE_AA)
+        cv.putText(image, "Finger Gesture:" + finger_gesture_text, (10,60),
+                   cv.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2, cv.LINE_AA)
     return image
 
 
 def draw_point_history(image, point_history):
     for index, point in enumerate(point_history):
         if point[0] != 0 and point[1] != 0:
-            cv.circle(image, (point[0], point[1]), 1 + int(index / 2),
-                      (152, 251, 152), 2)
+            cv.circle(image, (point[0], point[1]), 1+int(index/2), (152,251,152), 2)
     return image
 
 
-def draw_info(image, fps, mode, number):
-    cv.putText(image, "FPS:" + str(fps), (10, 30), cv.FONT_HERSHEY_SIMPLEX,
-               1.0, (0, 0, 0), 4, cv.LINE_AA)
-    cv.putText(image, "FPS:" + str(fps), (10, 30), cv.FONT_HERSHEY_SIMPLEX,
-               1.0, (255, 255, 255), 2, cv.LINE_AA)
+def draw_logging_info(image, fps, mode, class_name, saved_count):
+    # FPS
+    cv.putText(image, "FPS:" + str(fps), (10,30),
+               cv.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,0), 4, cv.LINE_AA)
+    cv.putText(image, "FPS:" + str(fps), (10,30),
+               cv.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2, cv.LINE_AA)
 
-    mode_string = ['Logging Key Point', 'Logging Point History']
-    if 1 <= mode <= 2:
-        cv.putText(image, "MODE:" + mode_string[mode - 1], (10, 90),
-                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
-        if 0 <= number <= 9:
-            cv.putText(image, "NUM:" + str(number), (10, 110),
-                       cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
-                       cv.LINE_AA)
+    if mode == 1 and class_name:
+        # Red banner at bottom so it's obvious you're recording
+        h, w = image.shape[:2]
+        cv.rectangle(image, (0, h-60), (w, h), (0,0,180), -1)
+        cv.putText(image,
+                   f"LOGGING: {class_name}   |   Saved: {saved_count}   |   Press S to save, N to stop",
+                   (10, h-20),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2, cv.LINE_AA)
+    else:
+        cv.putText(image, "Press K to start logging a new class", (10,90),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1, cv.LINE_AA)
+
     return image
 
 

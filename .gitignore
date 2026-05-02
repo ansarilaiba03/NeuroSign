@@ -1,5 +1,6 @@
 *.hdf5
 *.tflite
-venv/
-__pycache__/
 *.csv
+venv_run/
+venv_train/
+__pycache__/
