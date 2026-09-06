@@ -1,14 +1,13 @@
 # NeuroSign 🤟
 
-An AI-based system that converts sign language gestures into text (and speech) using computer vision and machine learning.
+An AI-based system that converts sign language gestures into text using computer vision and machine learning.
 
 ## 🌟 Features
 
 - **Real-time gesture recognition** via webcam input
 - **Keypoint-based classification** — hand landmarks are extracted and classified using a trained model
-- **Text-to-speech output** — recognized signs are converted to spoken audio
 - **Gesture history tracking**
-- **Responsive demo web interface** showcasing the recognition pipeline: Input → Preprocessing → Feature Extraction → Classification → Text Output → Speech Output
+- **Responsive demo web interface** showcasing the recognition pipeline: Input → Preprocessing → Feature Extraction → Classification → Text Output
 
 ## 🔤 Dataset — Indian Sign Language (ISL)
 
@@ -62,7 +61,6 @@ This landmark-based approach means adding a new sign doesn't require retraining 
 
 **Frontend**
 - HTML, CSS, JavaScript
-- Web Speech API for text-to-speech
 
 ## 📂 Structure
 
