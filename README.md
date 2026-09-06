@@ -20,29 +20,32 @@ Since ISL letters differ from ASL in several shapes (e.g. many ISL letters are f
 
 ### How the dataset was built
 
-The model doesn't classify raw images — it classifies **hand landmark keypoints** extracted by [MediaPipe Hands](https://developers.google.com/mediapipe/solutions/vision/hand_landmarker), which is lighter, faster, and more robust to background/lighting than raw image classification. This matches the `keypoint_classification.ipynb` and `point_history_classification.ipynb` notebooks in `backend/`.
+The model doesn't classify raw images — it classifies **hand landmark keypoints** extracted by [MediaPipe Hands](https://developers.google.com/mediapipe/solutions/vision/hand_landmarker), which is lighter, faster, and more robust to background/lighting than raw image classification.
 
-**Pipeline:**
-1. **Capture landmarks, not pixels** — For each webcam frame, MediaPipe Hands detects 21 keypoints per hand (x, y, z coordinates of each knuckle/fingertip).
-2. **Normalize** — Coordinates are converted to relative positions (relative to the wrist) and scaled, so the same gesture looks the same regardless of hand size or distance from the camera.
-3. **Label and log** — While holding a specific letter's hand shape, the normalized landmark vector is appended as a row to a CSV file, tagged with the letter's class label (e.g. `0` for A, `1` for B, ...).
-4. **Repeat per class** — This is done for all 26 letters, capturing many samples (ideally 100s per letter, from different angles/hand sizes/lighting) to build a balanced dataset.
-5. **Train a classifier** — The CSV of `(landmark_vector, label)` pairs is used to train a lightweight classifier (e.g. a small neural network or `RandomForest`/`SVM`), producing the model used in `backend/model/`.
-6. **Point-history model (for motion letters)** — For letters that involve movement (like H, J, Z), a second dataset tracks the *trajectory* of a keypoint (e.g. fingertip) over several frames, and a separate point-history classifier is trained to recognize the motion pattern.
+**Pipeline (as implemented in `backend/app.py`):**
+1. **Capture landmarks, not pixels** — For each webcam frame, MediaPipe Hands detects 21 keypoints per hand. If only one hand is visible, the second hand's slot is padded with zeros — so every sample is always a fixed-length **84-value vector** (42 values per hand × 2 hands).
+2. **Normalize** — Each hand's landmarks are shifted so the wrist (landmark 0) becomes the origin, then flattened and scaled by the largest absolute coordinate. This makes the vector independent of where the hand is in the frame or how big it appears.
+3. **Log a new class interactively** — While `app.py` is running:
+   - Press **`K`** to enter logging mode. The terminal prompts you to type a class name (e.g. `A`, `B`, `HELLO`) and press **Enter** — this registers a new label (or reuses an existing one) in `keypoint_classifier_label.csv`.
+   - Press **`S`** to save the current frame's landmark vector into `keypoint.csv`, tagged with whichever class is currently active.
+   - Press **`N`** to return to normal inference mode (no more logging).
+   - Press **`ESC`** to quit.
+4. **Repeat per class** — Do this for every letter/gesture, capturing many samples (ideally 100s per class, varied angle/lighting/hand size) to build a balanced dataset in `keypoint.csv`.
+5. **Retrain** — Run `keypoint_classification.ipynb` to train a classifier on the collected `keypoint.csv`, producing the `.hdf5` (full Keras model) and `.tflite` (compressed, used at runtime) files in `model/keypoint_classifier/`.
+6. **Point-history model (for motion letters)** — For dynamic gestures, `point_history_classifier` tracks a fingertip's position across the last 16 frames (triggered when the static classifier predicts a specific "tracking" class) and classifies that motion trajectory using a second, separately trained model in `model/point_history_classifier/`.
 
-### 🧑‍🏫 How to create your own dataset (e.g. for a different sign language or gesture set)
+### 🧑‍🏫 How to create your own dataset (e.g. to add new signs or a different gesture set)
 
-1. **Set up MediaPipe Hands** to run on your webcam feed and extract 21 landmark points per detected hand each frame.
-2. **Pick your classes** — decide the full list of gestures/letters you want to recognize and assign each a numeric label.
-3. **Build a data-collection script** — capture keyboard input (e.g. pressing `0`–`9` or a letter key) to mark "I am currently showing gesture X," and on each frame while that key is held, save the normalized landmark vector + label to a CSV (`keypoint.csv`).
-4. **Normalize consistently** — always convert landmarks to be relative to a fixed reference point (like the wrist) and scale them, so the dataset isn't sensitive to hand position/size in the frame.
-5. **Collect enough samples per class** — aim for a few hundred samples per gesture, varied across different people, hand sizes, angles, and lighting conditions to avoid overfitting.
-6. **Split into train/validation sets** — e.g. an 80/20 split, so you can measure real accuracy.
-7. **Train a classifier** on the CSV (a small feedforward neural network works well for this size of input, ~42-63 features per sample depending on 1 or 2 hands).
-8. **Export/save the trained model** and plug it into the inference script (`backend/app.py`) in place of the existing model.
-9. **(Optional) Repeat steps 3–8 with a point-history CSV** if any of your gestures involve motion rather than a static pose.
+1. **Run `backend/app.py`** with your webcam connected.
+2. **Press `K`** to enter logging mode, then type the class name in the terminal (e.g. a new letter or word) and hit **Enter**. This adds it to `keypoint_classifier_label.csv` if it's new.
+3. **Show the hand gesture** clearly to the camera and **press `S`** repeatedly (or hold, depending on your loop) to save several landmark samples for that class into `keypoint.csv`. Aim for a few hundred samples per class, varying hand angle, distance, and lighting.
+4. **Press `N`** to exit logging mode, then **`K`** again to start logging the next class — repeat for every gesture you want to add.
+5. **Press `ESC`** when you're done collecting data.
+6. **Retrain the model** by running `keypoint_classification.ipynb` — it reads the updated `keypoint.csv` and `keypoint_classifier_label.csv`, trains the classifier, and exports fresh `.hdf5`/`.tflite` files.
+7. **Restart `app.py`** — it will now recognize your new/updated gesture set.
+8. **(Optional) For motion-based gestures**, follow the equivalent process using the point-history logging path and retrain via a similar notebook for `point_history_classifier`.
 
-This approach (MediaPipe landmarks + a small classifier) makes it easy to add new gestures without retraining a full deep learning image model — you just collect more labeled landmark rows and retrain the lightweight classifier.
+This landmark-based approach means adding a new sign doesn't require retraining a full image-based deep learning model — you just collect more labeled landmark rows and retrain the lightweight classifier.
 
 ## 🎯 Applications
 
